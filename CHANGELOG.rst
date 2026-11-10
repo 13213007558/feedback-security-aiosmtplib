@@ -4,6 +4,12 @@ Changelog
 5.1.4 (unreleased)
 ------------------
 
+- Feature: new ``require_tls_for_auth`` option on ``SMTP`` (and ``send``) that
+  refuses to send authentication credentials unless the connection is actually
+  encrypted. The live transport state is checked before every login attempt,
+  so credentials are never sent in cleartext when the server does not
+  advertise STARTTLS, an upgrade fails, or the connection was re-established
+  in plaintext. Defaults to ``False``, preserving the previous behaviour
 - Bugfix: ``SMTPRecipientsRefused`` now exposes the ``message`` attribute shared
   by all ``SMTPException`` subclasses
 - Bugfix: resolve the ``SMTPProtocol`` close waiter on connection loss, so

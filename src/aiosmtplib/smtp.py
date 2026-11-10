@@ -114,6 +114,7 @@ class SMTP:
         timeout: float | None = DEFAULT_TIMEOUT,
         use_tls: bool = False,
         start_tls: bool | None = None,
+        require_tls_for_auth: bool = False,
         validate_certs: bool = True,
         client_cert: str | None = None,
         client_key: str | None = None,
@@ -149,6 +150,13 @@ class SMTP:
             If ``True``, and upgrade will be initiated regardless of server support.
             If ``False``, no upgrade will occur.
             Mutually exclusive with ``use_tls``.
+        :keyword require_tls_for_auth: If True, refuse to send authentication
+            credentials unless the connection is encrypted (via ``use_tls`` or a
+            completed STARTTLS upgrade). The actual transport state is checked
+            before every login attempt, so credentials are never sent in
+            cleartext, even if an upgrade failed or the connection was
+            re-established. Defaults to ``False``, which allows plaintext
+            authentication for backwards compatibility.
         :keyword validate_certs: Determines if server certificates are
             validated. defaults to ``True``.
         :keyword client_cert: Path to client side certificate, for TLS.
@@ -176,6 +184,7 @@ class SMTP:
         self.timeout = timeout
         self.use_tls = use_tls
         self._start_tls_on_connect = start_tls
+        self.require_tls_for_auth = require_tls_for_auth
         self.validate_certs = validate_certs
         self.client_cert = client_cert
         self.client_key = client_key
@@ -269,6 +278,7 @@ class SMTP:
         source_address: tuple[str, int] | Literal[Default.token] | None = Default.token,
         use_tls: bool | None = None,
         start_tls: bool | Literal[Default.token] | None = Default.token,
+        require_tls_for_auth: bool | None = None,
         validate_certs: bool | None = None,
         client_cert: str | Literal[Default.token] | None = Default.token,
         client_key: str | Literal[Default.token] | None = Default.token,
@@ -287,6 +297,8 @@ class SMTP:
             self.use_tls = use_tls
         if start_tls is not Default.token:
             self._start_tls_on_connect = start_tls
+        if require_tls_for_auth is not None:
+            self.require_tls_for_auth = require_tls_for_auth
         if validate_certs is not None:
             self.validate_certs = validate_certs
         if port is not Default.token:
@@ -379,6 +391,7 @@ class SMTP:
         timeout: float | Literal[Default.token] | None = Default.token,
         use_tls: bool | None = None,
         start_tls: bool | Literal[Default.token] | None = Default.token,
+        require_tls_for_auth: bool | None = None,
         validate_certs: bool | None = None,
         client_cert: str | Literal[Default.token] | None = Default.token,
         client_key: str | Literal[Default.token] | None = Default.token,
@@ -417,6 +430,9 @@ class SMTP:
             If ``True``, and upgrade will be initiated regardless of server support.
             If ``False``, no upgrade will occur.
             Mutually exclusive with ``use_tls``.
+        :keyword require_tls_for_auth: If True, refuse to send authentication
+            credentials unless the connection is encrypted. See
+            :class:`.SMTP` for details.
         :keyword validate_certs: Determines if server certificates are
             validated. defaults to ``True``.
         :keyword client_cert: Path to client side certificate, for TLS.
@@ -440,6 +456,7 @@ class SMTP:
             source_address=source_address,
             use_tls=use_tls,
             start_tls=start_tls,
+            require_tls_for_auth=require_tls_for_auth,
             validate_certs=validate_certs,
             client_cert=client_cert,
             client_key=client_key,
@@ -1133,6 +1150,37 @@ class SMTP:
 
     # Auth commands
 
+    async def _enforce_auth_transport_policy(self) -> None:
+        """
+        If required by config, verify that the connection is encrypted before
+        any authentication credentials are sent.
+
+        The check is made against the live transport on every call, so a
+        reconnect (or a failed STARTTLS upgrade) never inherits the security
+        state of a previous connection.
+
+        :raises SMTPNotSupported: encryption required but not in place
+        :raises SMTPServerDisconnected: connection lost
+        """
+        if not self.require_tls_for_auth:
+            return
+
+        if self.is_connected and self.get_transport_info("sslcontext") is not None:
+            return
+
+        await self._ehlo_or_helo_if_needed()
+
+        if not self.supports_extension("starttls"):
+            raise SMTPNotSupported(
+                "TLS is required for authentication, but the server does not "
+                "support the STARTTLS extension."
+            )
+
+        raise SMTPNotSupported(
+            "TLS is required for authentication, but the connection is not "
+            "encrypted. Call starttls() before authenticating."
+        )
+
     async def login(
         self,
         username: str | bytes,
@@ -1148,6 +1196,7 @@ class SMTP:
         all methods.
         """
         await self._ehlo_or_helo_if_needed()
+        await self._enforce_auth_transport_policy()
 
         if not self.supports_extension("auth"):
             if self.is_connected and self.get_transport_info("sslcontext") is None:
@@ -1202,6 +1251,8 @@ class SMTP:
             dGltIGI5MTNhNjAyYzdlZGE3YTQ5NWI0ZTZlNzMzNGQzODkw
 
         """
+        await self._enforce_auth_transport_policy()
+
         initial_response = await self.execute_command(
             b"AUTH", b"CRAM-MD5", timeout=timeout
         )
@@ -1240,6 +1291,8 @@ class SMTP:
             235 ok, go ahead (#2.0.0)
 
         """
+        await self._enforce_auth_transport_policy()
+
         encoded = auth_plain_encode(username, password)
         response = await self.execute_command(
             b"AUTH", b"PLAIN", encoded, timeout=timeout
@@ -1281,6 +1334,8 @@ class SMTP:
         However, since most servers seem to support both, we send the username
         with the initial request.
         """
+        await self._enforce_auth_transport_policy()
+
         encoded_username, encoded_password = auth_login_encode(username, password)
         initial_response = await self.execute_command(
             b"AUTH", b"LOGIN", encoded_username, timeout=timeout
@@ -1321,6 +1376,7 @@ class SMTP:
         We respond with an empty line to get the final error response.
         """
         await self._ehlo_or_helo_if_needed()
+        await self._enforce_auth_transport_policy()
 
         encoded = auth_xoauth2_encode(username, access_token)
         response = await self.execute_command(

@@ -33,6 +33,7 @@ async def send_all_options() -> None:
         timeout=124.34,
         use_tls=True,
         start_tls=False,
+        require_tls_for_auth=True,
         validate_certs=False,
         client_cert="test",
         client_key="test",

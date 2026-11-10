@@ -21,3 +21,39 @@ aiosmtplib supports the three main types of encryption used by SMTP servers:
    connetion using STARTTLS if the server supports it. If you want to opt out
    of upgrades even if the server supports them, pass a ``start_tls`` value of
    ``False``.
+
+Requiring encryption for authentication
+---------------------------------------
+
+Opportunistic STARTTLS (the default) is fine for plain message delivery, but
+it does not guarantee anything about the connection state by the time
+credentials are sent: the server may not advertise STARTTLS, the upgrade may
+fail, or the connection may have been re-established in plaintext.
+
+Pass ``require_tls_for_auth=True`` to make the client check the actual
+transport state before every authentication attempt (including automatic
+login on connect), and refuse to send credentials over an unencrypted
+connection. To merely *try* to upgrade, keep the defaults:
+
+.. code-block:: python
+
+    # Try to upgrade, but still authenticate if the connection stays plaintext
+    smtp_client = aiosmtplib.SMTP(hostname="smtp.example.com", port=587)
+
+To *require* encryption before any AUTH command is sent:
+
+.. code-block:: python
+
+    # Never send credentials unless the connection is encrypted
+    smtp_client = aiosmtplib.SMTP(
+        hostname="smtp.example.com",
+        port=587,
+        start_tls=True,
+        require_tls_for_auth=True,
+    )
+
+With ``require_tls_for_auth=True``, :meth:`SMTP.login` and the individual
+``auth_*`` methods raise :exc:`SMTPNotSupported` if the connection is not
+encrypted, and no credential bytes are written to the transport. The default
+value of ``False`` preserves the previous behaviour of allowing plaintext
+authentication.

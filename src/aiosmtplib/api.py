@@ -34,6 +34,7 @@ async def send(
     timeout: float | None = DEFAULT_TIMEOUT,
     use_tls: bool = False,
     start_tls: bool | None = None,
+    require_tls_for_auth: bool = False,
     validate_certs: bool = True,
     client_cert: str | None = None,
     client_key: str | None = None,
@@ -81,6 +82,9 @@ async def send(
         If ``True``, and upgrade will be initiated regardless of server support.
         If ``False``, no upgrade will occur.
         Mutually exclusive with ``use_tls``.
+    :keyword require_tls_for_auth: If True, refuse to send authentication
+        credentials unless the connection is encrypted. See :class:`.SMTP`
+        for details.
     :keyword validate_certs: Determines if server certificates are
         validated. Defaults to ``True``.
     :keyword client_cert: Path to client side certificate, for TLS.
@@ -114,6 +118,7 @@ async def send(
         timeout=timeout,
         use_tls=use_tls,
         start_tls=start_tls,
+        require_tls_for_auth=require_tls_for_auth,
         validate_certs=validate_certs,
         client_cert=client_cert,
         client_key=client_key,
