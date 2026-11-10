@@ -196,3 +196,41 @@ next.
 
 If you have a lot of emails to send, consider creating multiple connections
 (:class:`SMTP` instances) and splitting the work between them.
+
+Sharing an instance between tasks
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A single :class:`SMTP` instance may be shared between any number of tasks
+(e.g. a sending task, a ``NOOP`` heartbeat, and a re-login task). Each
+instance has its own *session lock* — instances never block each other —
+with the following rules:
+
+- High-level operations — :meth:`SMTP.connect`, :meth:`SMTP.login`,
+  :meth:`SMTP.sendmail`, :meth:`SMTP.send_message`, :meth:`SMTP.quit`, and
+  every individual command — acquire the session lock automatically, so a
+  command from one operation can never land between the ``MAIL``/``RCPT``/
+  ``DATA`` commands of another, or between the rounds of an ``AUTH``
+  exchange.
+- To combine low-level commands into one atomic unit, hold the session
+  explicitly with :meth:`SMTP.transaction`::
+
+      async with smtp.transaction():
+          await smtp.mail(sender)
+          await smtp.rcpt(recipient)
+          await smtp.data(message)
+
+  Transactions are reentrant per task: nesting them, or calling high-level
+  operations inside them, never deadlocks.
+- Cancelling a task that is still waiting for the session lock does not
+  affect the current holder or the other waiters.
+- If an operation fails, the session is only released as usable when the
+  protocol state is known to be clean: after a server error response an
+  ``RSET`` resets the envelope, while a connection whose state is uncertain
+  (timeout, disconnect, cancellation) is closed instead of being reused by
+  the next waiter.
+- :meth:`SMTP.quit` waits for the operation in progress to finish, then
+  closes the connection; operations still queued at that point fail with
+  :exc:`SMTPServerDisconnected` when they acquire the session.
+  :meth:`SMTP.close` is synchronous and does not wait: it tears the
+  connection down immediately, and any operation in progress or queued
+  fails with :exc:`SMTPServerDisconnected`.

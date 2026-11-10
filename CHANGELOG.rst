@@ -4,6 +4,12 @@ Changelog
 5.1.4 (unreleased)
 ------------------
 
+- Feature: an :class:`SMTP` instance can now be shared safely between tasks.
+  A per-instance session lock keeps concurrent operations (e.g. a ``NOOP``
+  heartbeat or a re-login) from interleaving commands into another
+  operation's ``MAIL``/``RCPT``/``DATA`` sequence or multi-round ``AUTH``
+  exchange, and the new reentrant :meth:`SMTP.transaction` context manager
+  lets callers hold the session explicitly when combining low-level commands
 - Bugfix: ``SMTPRecipientsRefused`` now exposes the ``message`` attribute shared
   by all ``SMTPException`` subclasses
 - Bugfix: resolve the ``SMTPProtocol`` close waiter on connection loss, so

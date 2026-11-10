@@ -8,7 +8,8 @@ import asyncio
 import email.message
 import socket
 import ssl
-from collections.abc import Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Sequence
+from contextlib import asynccontextmanager
 from types import TracebackType
 from typing import Any, Literal
 from .auth import (
@@ -51,6 +52,43 @@ SMTP_PORT = 25
 SMTP_TLS_PORT = 465
 SMTP_STARTTLS_PORT = 587
 DEFAULT_TIMEOUT = 60
+
+
+class _SessionLock:
+    """
+    A lock keyed on the current task, so that nested operations (e.g.
+    ``sendmail`` calling ``mail``/``rcpt``/``data``) re-enter instead of
+    deadlocking. Waiters cancelled in ``acquire`` never affect the owner.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task[Any] | None = None
+        self._depth = 0
+
+    @property
+    def depth(self) -> int:
+        return self._depth
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    async def acquire(self) -> None:
+        task = asyncio.current_task()
+        if task is self._owner:
+            self._depth += 1
+            return
+        await self._lock.acquire()
+        self._owner = task
+        self._depth = 1
+
+    def release(self) -> None:
+        if asyncio.current_task() is not self._owner:
+            raise RuntimeError("Session lock can only be released by its owner")
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+            self._lock.release()
 
 
 def _validate_local_hostname(hostname: str) -> str:
@@ -192,7 +230,7 @@ class SMTP:
         self.esmtp_extensions: dict[str, str] = {}
         self.supports_esmtp = False
         self.server_auth_methods: list[str] = []
-        self._sendmail_lock: asyncio.Lock | None = None
+        self._session_lock: _SessionLock | None = None
 
         self._validate_config()
 
@@ -255,6 +293,64 @@ class SMTP:
         Get all AUTH methods supported by the both server and by us.
         """
         return [auth for auth in self.AUTH_METHODS if auth in self.server_auth_methods]
+
+    def _get_session_lock(self) -> _SessionLock:
+        if self._session_lock is None:
+            self._session_lock = _SessionLock()
+
+        return self._session_lock
+
+    @asynccontextmanager
+    async def _hold_session(self) -> AsyncIterator[None]:
+        """
+        Hold the session lock without any cleanup on error. Used by
+        operations that manage their own connection state on failure.
+        """
+        lock = self._get_session_lock()
+        await lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator["SMTP"]:
+        """
+        Hold the session lock for a sequence of commands, so that no other
+        task can interleave its commands with ours.
+
+        High-level operations (``connect``, ``login``, ``sendmail``,
+        ``quit``, and each individual command) acquire the session lock
+        automatically; use this context manager when combining low-level
+        commands (e.g. ``mail``/``rcpt``/``data``) into one atomic unit.
+        Transactions are reentrant per task: nested transactions, and
+        high-level operations called within a transaction, do not deadlock.
+
+        On exit the lock is only released as usable when the protocol state
+        is known to be clean: after an :exc:`.SMTPResponseException` an
+        ``RSET`` is issued to reset the server envelope (closing the
+        connection if that fails), and after a cancellation the connection
+        is closed, since a cancelled command may have left the protocol
+        desynchronized.
+        """
+        lock = self._get_session_lock()
+        await lock.acquire()
+        outermost = lock.depth == 1
+        try:
+            yield self
+        except asyncio.CancelledError:
+            if outermost and self.is_connected:
+                self.close()
+            raise
+        except (SMTPResponseException, SMTPRecipientsRefused):
+            if outermost and self.is_connected:
+                try:
+                    await self.rset()
+                except (SMTPException, ConnectionError):
+                    self.close()
+            raise
+        finally:
+            lock.release()
 
     def _update_settings_from_kwargs(
         self,
@@ -463,18 +559,19 @@ class SMTP:
         # The lock is held until close(), serializing concurrent connect calls.
         await self._connect_lock.acquire()
 
-        try:
-            if self.local_hostname is None:
-                self.local_hostname = await self._get_default_local_hostname()
+        async with self._hold_session():
+            try:
+                if self.local_hostname is None:
+                    self.local_hostname = await self._get_default_local_hostname()
 
-            response = await self._create_connection(
-                timeout=self.timeout if timeout is Default.token else timeout
-            )
-            await self._maybe_start_tls_on_connect()
-            await self._maybe_login_on_connect()
-        except (Exception, asyncio.CancelledError):
-            self.close()  # Reset to disconnected and release the lock
-            raise
+                response = await self._create_connection(
+                    timeout=self.timeout if timeout is Default.token else timeout
+                )
+                await self._maybe_start_tls_on_connect()
+                await self._maybe_login_on_connect()
+            except (Exception, asyncio.CancelledError):
+                self.close()  # Reset to disconnected and release the lock
+                raise
 
         return response
 
@@ -606,29 +703,30 @@ class SMTP:
 
         :raises SMTPServerDisconnected: connection lost
         """
-        if self.protocol is None:
-            raise SMTPServerDisconnected("Server not connected")
+        async with self._hold_session():
+            if self.protocol is None:
+                raise SMTPServerDisconnected("Server not connected")
 
-        try:
-            response = await self.protocol.execute_command(
-                *args, timeout=self.timeout if timeout is Default.token else timeout
-            )
-        except (SMTPServerDisconnected, SMTPTimeoutError):
-            # A read timeout leaves the protocol desynced (a partial buffer and
-            # a server response we gave up on), so close rather than risk
-            # mispairing that response with a later command.
-            self.close()
-            raise
-        except (SMTPResponseException, asyncio.CancelledError):
-            # The protocol closes its transport on a malformed reply or if
-            # cancelled mid-command
-            if not self.is_connected:
+            try:
+                response = await self.protocol.execute_command(
+                    *args, timeout=self.timeout if timeout is Default.token else timeout
+                )
+            except (SMTPServerDisconnected, SMTPTimeoutError):
+                # A read timeout leaves the protocol desynced (a partial buffer and
+                # a server response we gave up on), so close rather than risk
+                # mispairing that response with a later command.
                 self.close()
-            raise
+                raise
+            except (SMTPResponseException, asyncio.CancelledError):
+                # The protocol closes its transport on a malformed reply or if
+                # cancelled mid-command
+                if not self.is_connected:
+                    self.close()
+                raise
 
-        # If the server is unavailable, be nice and close the connection
-        if response.code == SMTPStatus.domain_unavailable:
-            self.close()
+            # If the server is unavailable, be nice and close the connection
+            if response.code == SMTPStatus.domain_unavailable:
+                self.close()
 
         return response
 
@@ -664,6 +762,11 @@ class SMTP:
     def close(self) -> None:
         """
         Closes the connection.
+
+        Synchronous and immediate: it does not wait for the session lock.
+        An operation in progress fails with
+        :exc:`.SMTPServerDisconnected`, and operations queued behind it
+        fail the same way when they acquire the session.
         """
         if self.transport is not None and not self.transport.is_closing():
             self.transport.close()
@@ -871,13 +974,18 @@ class SMTP:
         Send the SMTP QUIT command, which closes the connection.
         Also closes the connection from our side after a response is received.
 
+        Waits for any operation in progress to finish first; operations
+        still queued when the connection closes will fail with
+        :exc:`.SMTPServerDisconnected` when they acquire the session.
+
         :raises SMTPResponseException: on unexpected server response code
         """
-        response = await self.execute_command(b"QUIT", timeout=timeout)
-        if response.code != SMTPStatus.closing:
-            raise SMTPResponseException(response.code, response.message)
+        async with self._hold_session():
+            response = await self.execute_command(b"QUIT", timeout=timeout)
+            if response.code != SMTPStatus.closing:
+                raise SMTPResponseException(response.code, response.message)
 
-        self.close()
+            self.close()
 
         return response
 
@@ -964,24 +1072,26 @@ class SMTP:
         """
         await self._ehlo_or_helo_if_needed()
 
-        if self.protocol is None:
-            raise SMTPServerDisconnected("Connection lost")
-
         if timeout is Default.token:
             timeout = self.timeout
 
         if isinstance(message, str):
             message = message.encode("ascii")
 
-        try:
-            return await self.protocol.execute_data_command(message, timeout=timeout)
-        except (SMTPServerDisconnected, SMTPTimeoutError):
-            self.close()
-            raise
-        except (SMTPResponseException, asyncio.CancelledError):
-            if not self.is_connected:
+        async with self._hold_session():
+            protocol = self.protocol
+            if protocol is None:
+                raise SMTPServerDisconnected("Connection lost")
+
+            try:
+                return await protocol.execute_data_command(message, timeout=timeout)
+            except (SMTPServerDisconnected, SMTPTimeoutError):
                 self.close()
-            raise
+                raise
+            except (SMTPResponseException, asyncio.CancelledError):
+                if not self.is_connected:
+                    self.close()
+                raise
 
     # ESMTP commands #
 
@@ -1079,55 +1189,56 @@ class SMTP:
         :raises SMTPServerDisconnected: connection lost
         :raises ValueError: invalid options provided
         """
-        if self.get_transport_info("sslcontext") is not None:
-            raise SMTPException("Connection already using TLS")
+        async with self._hold_session():
+            if self.get_transport_info("sslcontext") is not None:
+                raise SMTPException("Connection already using TLS")
 
-        self._update_settings_from_kwargs(
-            validate_certs=validate_certs,
-            client_cert=client_cert,
-            client_key=client_key,
-            cert_bundle=cert_bundle,
-            tls_context=tls_context,
-        )
-        self._validate_config()
-
-        await self._ehlo_or_helo_if_needed()
-
-        protocol = self.protocol
-        if protocol is None:
-            raise SMTPServerDisconnected("Connection lost")
-
-        if server_hostname is None:
-            server_hostname = self.hostname
-
-        if timeout is Default.token:
-            timeout = self.timeout
-
-        tls_context = await self._get_tls_context()
-
-        if not self.supports_extension("starttls"):
-            raise SMTPException("SMTP STARTTLS extension not supported by server.")
-
-        try:
-            response = await protocol.start_tls(
-                tls_context, server_hostname=server_hostname, timeout=timeout
+            self._update_settings_from_kwargs(
+                validate_certs=validate_certs,
+                client_cert=client_cert,
+                client_key=client_key,
+                cert_bundle=cert_bundle,
+                tls_context=tls_context,
             )
-        except (SMTPServerDisconnected, SMTPTimeoutError):
-            self.close()
-            raise
-        except (SMTPResponseException, asyncio.CancelledError):
-            if not self.is_connected:
+            self._validate_config()
+
+            await self._ehlo_or_helo_if_needed()
+
+            protocol = self.protocol
+            if protocol is None:
+                raise SMTPServerDisconnected("Connection lost")
+
+            if server_hostname is None:
+                server_hostname = self.hostname
+
+            if timeout is Default.token:
+                timeout = self.timeout
+
+            tls_context = await self._get_tls_context()
+
+            if not self.supports_extension("starttls"):
+                raise SMTPException("SMTP STARTTLS extension not supported by server.")
+
+            try:
+                response = await protocol.start_tls(
+                    tls_context, server_hostname=server_hostname, timeout=timeout
+                )
+            except (SMTPServerDisconnected, SMTPTimeoutError):
                 self.close()
-            raise
+                raise
+            except (SMTPResponseException, asyncio.CancelledError):
+                if not self.is_connected:
+                    self.close()
+                raise
 
-        # Update our transport reference
-        self.transport = protocol.transport
+            # Update our transport reference
+            self.transport = protocol.transport
 
-        # RFC 3207 part 4.2:
-        # The client MUST discard any knowledge obtained from the server, such
-        # as the list of SMTP service extensions, which was not obtained from
-        # the TLS negotiation itself.
-        self._reset_server_state()
+            # RFC 3207 part 4.2:
+            # The client MUST discard any knowledge obtained from the server, such
+            # as the list of SMTP service extensions, which was not obtained from
+            # the TLS negotiation itself.
+            self._reset_server_state()
 
         return response
 
@@ -1146,39 +1257,45 @@ class SMTP:
         Some servers advertise authentication methods they don't really
         support, so if authentication fails, we continue until we've tried
         all methods.
+
+        The session lock is held for the whole login, so that no other
+        operation can interleave commands between the auth rounds.
         """
-        await self._ehlo_or_helo_if_needed()
+        async with self._hold_session():
+            await self._ehlo_or_helo_if_needed()
 
-        if not self.supports_extension("auth"):
-            if self.is_connected and self.get_transport_info("sslcontext") is None:
+            if not self.supports_extension("auth"):
+                if self.is_connected and self.get_transport_info("sslcontext") is None:
+                    raise SMTPException(
+                        "The SMTP AUTH extension is not supported by this server. "
+                        "Try connecting via TLS (or STARTTLS)."
+                    )
                 raise SMTPException(
-                    "The SMTP AUTH extension is not supported by this server. Try "
-                    "connecting via TLS (or STARTTLS)."
+                    "The SMTP AUTH extension is not supported by this server."
                 )
-            raise SMTPException(
-                "The SMTP AUTH extension is not supported by this server."
-            )
 
-        response: SMTPResponse | None = None
-        exception: SMTPAuthenticationError | None = None
-        for auth_name in self.supported_auth_methods:
-            method_name = f"auth_{auth_name.replace('-', '')}"
-            try:
-                auth_method = getattr(self, method_name)
-            except AttributeError as err:
-                raise RuntimeError(
-                    f"Missing handler for auth method {auth_name}"
-                ) from err
-            try:
-                response = await auth_method(username, password, timeout=timeout)
-            except SMTPAuthenticationError as exc:
-                exception = exc
-            else:
-                # No exception means we're good
-                break
+            response: SMTPResponse | None = None
+            exception: SMTPAuthenticationError | None = None
+            for auth_name in self.supported_auth_methods:
+                method_name = f"auth_{auth_name.replace('-', '')}"
+                try:
+                    auth_method = getattr(self, method_name)
+                except AttributeError as err:
+                    raise RuntimeError(
+                        f"Missing handler for auth method {auth_name}"
+                    ) from err
+                try:
+                    response = await auth_method(username, password, timeout=timeout)
+                except SMTPAuthenticationError as exc:
+                    exception = exc
+                else:
+                    # No exception means we're good
+                    break
 
-        if response is None:
-            raise exception or SMTPException("No suitable authentication method found.")
+            if response is None:
+                raise exception or SMTPException(
+                    "No suitable authentication method found."
+                )
 
         return response
 
@@ -1202,19 +1319,20 @@ class SMTP:
             dGltIGI5MTNhNjAyYzdlZGE3YTQ5NWI0ZTZlNzMzNGQzODkw
 
         """
-        initial_response = await self.execute_command(
-            b"AUTH", b"CRAM-MD5", timeout=timeout
-        )
-
-        if initial_response.code != SMTPStatus.auth_continue:
-            raise SMTPAuthenticationError(
-                initial_response.code, initial_response.message
+        async with self._hold_session():
+            initial_response = await self.execute_command(
+                b"AUTH", b"CRAM-MD5", timeout=timeout
             )
 
-        verification_bytes = auth_crammd5_verify(
-            username, password, initial_response.message
-        )
-        response = await self.execute_command(verification_bytes, timeout=timeout)
+            if initial_response.code != SMTPStatus.auth_continue:
+                raise SMTPAuthenticationError(
+                    initial_response.code, initial_response.message
+                )
+
+            verification_bytes = auth_crammd5_verify(
+                username, password, initial_response.message
+            )
+            response = await self.execute_command(verification_bytes, timeout=timeout)
 
         if response.code != SMTPStatus.auth_successful:
             raise SMTPAuthenticationError(response.code, response.message)
@@ -1281,17 +1399,18 @@ class SMTP:
         However, since most servers seem to support both, we send the username
         with the initial request.
         """
-        encoded_username, encoded_password = auth_login_encode(username, password)
-        initial_response = await self.execute_command(
-            b"AUTH", b"LOGIN", encoded_username, timeout=timeout
-        )
-
-        if initial_response.code != SMTPStatus.auth_continue:
-            raise SMTPAuthenticationError(
-                initial_response.code, initial_response.message
+        async with self._hold_session():
+            encoded_username, encoded_password = auth_login_encode(username, password)
+            initial_response = await self.execute_command(
+                b"AUTH", b"LOGIN", encoded_username, timeout=timeout
             )
 
-        response = await self.execute_command(encoded_password, timeout=timeout)
+            if initial_response.code != SMTPStatus.auth_continue:
+                raise SMTPAuthenticationError(
+                    initial_response.code, initial_response.message
+                )
+
+            response = await self.execute_command(encoded_password, timeout=timeout)
 
         if response.code != SMTPStatus.auth_successful:
             raise SMTPAuthenticationError(response.code, response.message)
@@ -1322,14 +1441,16 @@ class SMTP:
         """
         await self._ehlo_or_helo_if_needed()
 
-        encoded = auth_xoauth2_encode(username, access_token)
-        response = await self.execute_command(
-            b"AUTH", b"XOAUTH2", encoded, timeout=timeout
-        )
+        async with self._hold_session():
+            encoded = auth_xoauth2_encode(username, access_token)
+            response = await self.execute_command(
+                b"AUTH", b"XOAUTH2", encoded, timeout=timeout
+            )
 
-        if response.code == SMTPStatus.auth_continue:
-            # Server sent an error challenge; send empty response to get final error
-            response = await self.execute_command(b"", timeout=timeout)
+            if response.code == SMTPStatus.auth_continue:
+                # Server sent an error challenge; send empty response to get
+                # the final error
+                response = await self.execute_command(b"", timeout=timeout)
 
         if response.code != SMTPStatus.auth_successful:
             raise SMTPAuthenticationError(response.code, response.message)
@@ -1437,57 +1558,39 @@ class SMTP:
         for option in rcpt_options:
             option.encode("ascii")
 
-        if self._sendmail_lock is None:
-            self._sendmail_lock = asyncio.Lock()
+        # Make sure we've done an EHLO for extension checks
+        await self._ehlo_or_helo_if_needed()
 
-        async with self._sendmail_lock:
-            # Make sure we've done an EHLO for extension checks
-            await self._ehlo_or_helo_if_needed()
+        if mailbox_encoding == "utf-8" and not self.supports_extension("smtputf8"):
+            raise SMTPNotSupported("SMTPUTF8 is not supported by this server")
 
-            if mailbox_encoding == "utf-8" and not self.supports_extension("smtputf8"):
-                raise SMTPNotSupported("SMTPUTF8 is not supported by this server")
+        if self.supports_extension("size") and not any(
+            option.lower().startswith("size=") for option in mail_options
+        ):
+            # RFC 1870: the size is the number of octets, including CRLF
+            # pairs, as the message will be transmitted in the DATA command.
+            message_bytes = (
+                message.encode("ascii") if isinstance(message, str) else message
+            )
+            message_len = len(normalize_message_line_endings(message_bytes))
+            size_option = f"size={message_len}"
+            mail_options.insert(0, size_option)
 
-            if self.supports_extension("size") and not any(
-                option.lower().startswith("size=") for option in mail_options
-            ):
-                # RFC 1870: the size is the number of octets, including CRLF
-                # pairs, as the message will be transmitted in the DATA command.
-                message_bytes = (
-                    message.encode("ascii") if isinstance(message, str) else message
-                )
-                message_len = len(normalize_message_line_endings(message_bytes))
-                size_option = f"size={message_len}"
-                mail_options.insert(0, size_option)
-
-            try:
-                await self.mail(
-                    sender,
-                    options=mail_options,
-                    encoding=mailbox_encoding,
-                    timeout=timeout,
-                )
-                recipient_errors = await self._send_recipients(
-                    recipients, rcpt_options, encoding=mailbox_encoding, timeout=timeout
-                )
-                response = await self.data(message, timeout=timeout)
-            except (SMTPResponseException, SMTPRecipientsRefused) as exc:
-                # If we got an error, reset the envelope.
-                try:
-                    await self.rset(timeout=timeout)
-                except (ConnectionError, SMTPResponseException):
-                    # If we're disconnected on the reset, or we get a bad
-                    # status, don't raise that as it's confusing
-                    pass
-                raise exc
-            except asyncio.CancelledError:
-                # The envelope may be half-open on the server, and a RSET round
-                # trip after a cancellation could block or be cancelled again,
-                # so drop the connection instead.
-                self.close()
-                raise
+        # The transaction holds the session lock until the envelope is done,
+        # and resets (or closes) on failure before releasing it.
+        async with self.transaction():
+            await self.mail(
+                sender,
+                options=mail_options,
+                encoding=mailbox_encoding,
+                timeout=timeout,
+            )
+            recipient_errors = await self._send_recipients(
+                recipients, rcpt_options, encoding=mailbox_encoding, timeout=timeout
+            )
+            response = await self.data(message, timeout=timeout)
 
         return recipient_errors, response.message
-
     async def _send_recipients(
         self,
         recipients: Sequence[str],
