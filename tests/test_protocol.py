@@ -985,3 +985,91 @@ async def test_protocol_start_tls_transport_closing_after_reply(
 
     with pytest.raises(SMTPServerDisconnected, match="Connection lost"):
         await task
+
+
+async def test_protocol_data_committed_false_until_end_marker() -> None:
+    """
+    data_committed must only become True after the full message, including
+    the end-of-data marker, has been handed to the transport.
+    """
+    protocol = SMTPProtocol()
+    transport = _WriteRecordingTransport()
+    protocol.connection_made(transport)
+
+    task = asyncio.ensure_future(protocol.execute_data_command(b"hello", timeout=1.0))
+    await asyncio.sleep(0)
+    protocol.data_received(b"354 go\r\n")
+    await asyncio.sleep(0)
+
+    # The whole small message is one write that includes the marker, so once
+    # the drain completes it is committed, ahead of the final reply.
+    assert protocol.data_committed
+
+    protocol.data_received(b"250 ok\r\n")
+    response = await task
+    assert response.code == 250
+    assert protocol.data_committed
+
+
+async def test_protocol_data_committed_false_after_data_reply_failure() -> None:
+    """A refused DATA command never reaches the upload/commit boundary."""
+    protocol = SMTPProtocol()
+    transport = _WriteRecordingTransport()
+    protocol.connection_made(transport)
+
+    task = asyncio.ensure_future(protocol.execute_data_command(b"hello", timeout=1.0))
+    await asyncio.sleep(0)
+    protocol.data_received(b"502 bad sequence\r\n")
+
+    with pytest.raises(SMTPResponseException):
+        await task
+
+    assert not protocol.data_committed
+
+
+async def test_protocol_data_committed_then_disconnect_is_observable() -> None:
+    """
+    A disconnect while awaiting the final reply leaves data_committed True,
+    letting the caller distinguish 'submitted, outcome unknown' from
+    'never submitted'.
+    """
+    protocol = SMTPProtocol()
+    transport = _WriteRecordingTransport()
+    protocol.connection_made(transport)
+
+    task = asyncio.ensure_future(protocol.execute_data_command(b"hello", timeout=1.0))
+    await asyncio.sleep(0)
+    protocol.data_received(b"354 go\r\n")
+    await asyncio.sleep(0)
+    assert protocol.data_committed
+
+    protocol.connection_lost(ConnectionResetError("boom"))
+
+    with pytest.raises(SMTPServerDisconnected):
+        await task
+
+    assert protocol.data_committed
+
+
+async def test_protocol_data_committed_resets_per_data_command() -> None:
+    protocol = SMTPProtocol()
+    transport = _WriteRecordingTransport()
+    protocol.connection_made(transport)
+
+    first = asyncio.ensure_future(protocol.execute_data_command(b"one", timeout=1.0))
+    await asyncio.sleep(0)
+    protocol.data_received(b"354 go\r\n")
+    await asyncio.sleep(0)
+    protocol.data_received(b"250 ok\r\n")
+    await first
+    assert protocol.data_committed
+
+    second = asyncio.ensure_future(protocol.execute_data_command(b"two", timeout=1.0))
+    await asyncio.sleep(0)
+    # Reset at the start of the new DATA command, before its 354 reply.
+    assert not protocol.data_committed
+    protocol.data_received(b"354 go\r\n")
+    await asyncio.sleep(0)
+    protocol.data_received(b"250 ok\r\n")
+    await second
+    assert protocol.data_committed

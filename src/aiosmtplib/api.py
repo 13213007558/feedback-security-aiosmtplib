@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from typing import cast
 
 from .response import SMTPResponse
+from .result import attach_send_result
 from .smtp import DEFAULT_TIMEOUT, SMTP
 from .typing import SMTPTokenGenerator, SocketPathType
 
@@ -127,21 +128,29 @@ async def send(
     )
 
     async with client:
-        if isinstance(message, (str, bytes)):
-            result = await client.sendmail(
-                sender,
-                recipients,
-                message,
-                mail_options=mail_options,
-                rcpt_options=rcpt_options,
-            )
-        else:
-            result = await client.send_message(
-                message,
-                sender=sender,
-                recipients=recipients,
-                mail_options=mail_options,
-                rcpt_options=rcpt_options,
-            )
+        try:
+            if isinstance(message, (str, bytes)):
+                result = await client.sendmail(
+                    sender,
+                    recipients,
+                    message,
+                    mail_options=mail_options,
+                    rcpt_options=rcpt_options,
+                )
+            else:
+                result = await client.send_message(
+                    message,
+                    sender=sender,
+                    recipients=recipients,
+                    mail_options=mail_options,
+                    rcpt_options=rcpt_options,
+                )
+        except BaseException as exc:
+            # The local client goes out of scope when this frame unwinds, so
+            # mirror the transaction progress onto the raised exception
+            # (including asyncio.CancelledError) for the caller.
+            if getattr(exc, "send_result", None) is None:
+                attach_send_result(exc, client.last_send_result)
+            raise
 
     return result

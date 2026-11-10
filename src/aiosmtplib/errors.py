@@ -1,4 +1,8 @@
 from asyncio import TimeoutError
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .result import SMTPSendResult
 
 
 __all__ = (
@@ -24,6 +28,11 @@ class SMTPException(Exception):
     """
     Base class for all SMTP exceptions.
     """
+
+    #: Progress of the transaction that was in flight, when the exception was
+    #: raised by ``sendmail``/``send_message``/``send``. None for exceptions
+    #: raised outside a mail transaction.
+    send_result: "SMTPSendResult | None" = None
 
     def __init__(self, message: str, /) -> None:
         self.message = message

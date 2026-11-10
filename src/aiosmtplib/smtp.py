@@ -28,6 +28,7 @@ from .errors import (
     SMTPAuthenticationError,
     SMTPConnectError,
     SMTPConnectTimeoutError,
+    SMTPDataError,
     SMTPException,
     SMTPHeloError,
     SMTPNotSupported,
@@ -42,6 +43,7 @@ from .errors import (
 from .esmtp import parse_esmtp_extensions
 from .protocol import SMTPProtocol, normalize_message_line_endings
 from .response import SMTPResponse
+from .result import SMTPSendResult, attach_send_result
 from .typing import Default, SMTPStatus, SMTPTokenGenerator, SocketPathType
 
 
@@ -193,6 +195,10 @@ class SMTP:
         self.supports_esmtp = False
         self.server_auth_methods: list[str] = []
         self._sendmail_lock: asyncio.Lock | None = None
+        #: Progress of the most recent sendmail transaction. Survives the
+        #: disconnect that follows a timeout or cancellation, so the outcome
+        #: can be inspected from an exception handler. Reset on every sendmail.
+        self.last_send_result: SMTPSendResult | None = None
 
         self._validate_config()
 
@@ -973,15 +979,36 @@ class SMTP:
         if isinstance(message, str):
             message = message.encode("ascii")
 
+        protocol = self.protocol
         try:
-            return await self.protocol.execute_data_command(message, timeout=timeout)
-        except (SMTPServerDisconnected, SMTPTimeoutError):
+            return await protocol.execute_data_command(message, timeout=timeout)
+        except (SMTPServerDisconnected, SMTPTimeoutError) as exc:
+            # Snapshot the confirmation boundary before close() drops the
+            # protocol reference: a failure after the end-of-data marker was
+            # handed off leaves delivery unknown, not safely retryable.
+            self._record_data_failure(exc, protocol.data_committed)
             self.close()
             raise
-        except (SMTPResponseException, asyncio.CancelledError):
+        except (SMTPResponseException, asyncio.CancelledError) as exc:
+            self._record_data_failure(exc, protocol.data_committed)
             if not self.is_connected:
                 self.close()
             raise
+
+    def _record_data_failure(self, error: BaseException, data_committed: bool) -> None:
+        """
+        Update the in-flight send result with how far DATA got, if a
+        transaction is being tracked.
+        """
+        result = self.last_send_result
+        if result is None:
+            return
+
+        if data_committed:
+            result.mark_submitted()
+            result.mark_failed(error)
+        else:
+            result.mark_data_interrupted(error)
 
     # ESMTP commands #
 
@@ -1437,6 +1464,10 @@ class SMTP:
         for option in rcpt_options:
             option.encode("ascii")
 
+        recipients = tuple(recipients)
+        result = SMTPSendResult(sender=sender, recipients=recipients)
+        self.last_send_result = result
+
         if self._sendmail_lock is None:
             self._sendmail_lock = asyncio.Lock()
 
@@ -1466,27 +1497,66 @@ class SMTP:
                     encoding=mailbox_encoding,
                     timeout=timeout,
                 )
+                result.mark_envelope_open(sender, recipients)
                 recipient_errors = await self._send_recipients(
-                    recipients, rcpt_options, encoding=mailbox_encoding, timeout=timeout
+                    recipients,
+                    rcpt_options,
+                    encoding=mailbox_encoding,
+                    timeout=timeout,
+                    result=result,
                 )
                 response = await self.data(message, timeout=timeout)
             except (SMTPResponseException, SMTPRecipientsRefused) as exc:
-                # If we got an error, reset the envelope.
+                # A definitive refusal, or an interruption before the
+                # end-of-data marker. Reset the envelope for the next attempt.
+                self._record_send_failure(result, exc)
                 try:
                     await self.rset(timeout=timeout)
                 except (ConnectionError, SMTPResponseException):
                     # If we're disconnected on the reset, or we get a bad
                     # status, don't raise that as it's confusing
                     pass
+                self._attach_send_result(exc, result)
                 raise exc
-            except asyncio.CancelledError:
+            except (SMTPServerDisconnected, SMTPTimeoutError) as exc:
+                # The connection is already closed by execute_command/data;
+                # record the boundary reached and surface it on the exception.
+                self._record_send_failure(result, exc)
+                self._attach_send_result(exc, result)
+                raise
+            except asyncio.CancelledError as exc:
                 # The envelope may be half-open on the server, and a RSET round
                 # trip after a cancellation could block or be cancelled again,
-                # so drop the connection instead.
+                # so drop the connection instead. Cancellation semantics are
+                # preserved: the same CancelledError is re-raised.
+                self._record_send_failure(result, exc)
                 self.close()
+                self._attach_send_result(exc, result)
                 raise
 
+            result.mark_accepted(response)
+
         return recipient_errors, response.message
+
+    @staticmethod
+    def _record_send_failure(result: SMTPSendResult, error: BaseException) -> None:
+        """
+        Record a definitive refusal on the result; interruptions before the
+        end-of-data marker keep their not-submitted state.
+        """
+        if isinstance(error, SMTPDataError) and result.state.submitted:
+            result.mark_rejected(SMTPResponse(error.code, error.message), error)
+            return
+
+        result.mark_failed(error)
+
+    @staticmethod
+    def _attach_send_result(error: BaseException, result: SMTPSendResult) -> None:
+        """
+        Make the transaction progress readable from the raised exception.
+        Works for every exception type, including asyncio.CancelledError.
+        """
+        attach_send_result(error, result)
 
     async def _send_recipients(
         self,
@@ -1494,6 +1564,8 @@ class SMTP:
         options: Iterable[str],
         encoding: str = "ascii",
         timeout: float | Literal[Default.token] | None = Default.token,
+        *,
+        result: SMTPSendResult | None = None,
     ) -> dict[str, SMTPResponse]:
         """
         Send the recipients given to the server. Used as part of
@@ -1507,6 +1579,13 @@ class SMTP:
                 )
             except SMTPRecipientRefused as exc:
                 recipient_errors.append(exc)
+                if result is not None:
+                    result.mark_recipient_refused(
+                        exc.recipient, SMTPResponse(exc.code, exc.message)
+                    )
+            else:
+                if result is not None:
+                    result.mark_recipient_accepted(address)
 
         if len(recipient_errors) == len(recipients):
             raise SMTPRecipientsRefused(recipient_errors)

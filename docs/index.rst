@@ -15,6 +15,7 @@ Table of Contents
 
    quickstart
    usage
+   send-status
    client
    encryption
    oauth

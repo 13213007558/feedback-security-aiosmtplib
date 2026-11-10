@@ -29,6 +29,7 @@ from .errors import (
     SMTPTimeoutError,
 )
 from .response import SMTPResponse
+from .result import SMTPSendResult, SMTPSendState
 from .smtp import SMTP
 from .typing import SMTPStatus, SMTPTokenGenerator
 
@@ -42,6 +43,8 @@ __all__ = (
     "SMTP",
     "SMTPResponse",
     "SMTPStatus",
+    "SMTPSendState",
+    "SMTPSendResult",
     "SMTPTokenGenerator",
     "SMTPAuthenticationError",
     "SMTPConnectError",

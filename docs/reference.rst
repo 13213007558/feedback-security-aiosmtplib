@@ -34,6 +34,17 @@ Server Responses
     :members:
 
 
+Send Results
+------------
+
+.. autoclass:: aiosmtplib.result.SMTPSendState
+    :members:
+    :undoc-members:
+
+.. autoclass:: aiosmtplib.result.SMTPSendResult
+    :members:
+
+
 Status Codes
 ------------
 

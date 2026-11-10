@@ -4,6 +4,19 @@ Changelog
 5.1.4 (unreleased)
 ------------------
 
+- Feature: mail transactions now report how far they progressed. New
+  :class:`aiosmtplib.SMTPSendState` distinguishes transactions not yet
+  submitted (before the DATA end-of-data marker), those with a definitive
+  server reply (accepted or rejected), and those whose outcome is unknown
+  (the end marker was sent but the connection dropped, timed out or was
+  cancelled before the final reply). A new :class:`aiosmtplib.SMTPSendResult`
+  is exposed as :attr:`aiosmtplib.SMTP.last_send_result` and attached to any
+  exception raised by ``sendmail``/``send_message``/``send`` (including
+  ``asyncio.CancelledError``) as its ``send_result`` attribute. The result
+  keeps per-recipient RCPT accept/refuse replies, stores no message body, and
+  the successful ``sendmail`` return value is unchanged. The library never
+  retries a transaction itself; applications use the state to decide between
+  a safe resend, manual reconciliation, and an idempotency-guarded retry
 - Bugfix: ``SMTPRecipientsRefused`` now exposes the ``message`` attribute shared
   by all ``SMTPException`` subclasses
 - Bugfix: resolve the ``SMTPProtocol`` close waiter on connection loss, so

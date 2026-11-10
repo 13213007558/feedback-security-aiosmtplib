@@ -165,7 +165,20 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
         self._command_lock: asyncio.Lock | None = None
         self._closed_future: "asyncio.Future[None]" = self._loop.create_future()
         self._quit_sent = False
+        # True once the end-of-data marker of the current/last DATA command
+        # has been handed to the transport. This is the confirmation
+        # boundary: before it the server cannot have accepted the message;
+        # after it, a dropped connection leaves delivery unknown.
+        self._data_committed = False
         self._connection_lost_callback = connection_lost_callback
+
+    @property
+    def data_committed(self) -> bool:
+        """
+        Whether the end-of-data marker of the most recent DATA command has
+        been handed to the transport.
+        """
+        return self._data_committed
 
     def _get_close_waiter(self, stream: asyncio.StreamWriter) -> "asyncio.Future[None]":
         return self._closed_future
@@ -183,6 +196,7 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
         self._response_waiter = self._loop.create_future()
         self._command_lock = asyncio.Lock()
         self._quit_sent = False
+        self._data_committed = False
         # The server's greeting is expected immediately after connecting, and
         # may arrive before read_response() is awaited, so arm the flag now.
         self._response_pending = True
@@ -459,6 +473,7 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
         async with self._command_lock:
             # Mark a reply as expected before each send (see execute_command).
             self._response_pending = True
+            self._data_committed = False
             self.write(b"DATA\r\n")
             start_response = await self._read_response_or_close(timeout=timeout)
             if start_response.code != SMTPStatus.start_input:
@@ -472,6 +487,10 @@ class SMTPProtocol(FlowControlMixin, asyncio.BaseProtocol):
             for start in range(0, len(view), DATA_CHUNK_SIZE):
                 chunk = bytes(view[start : start + DATA_CHUNK_SIZE])
                 await self._write_and_drain(chunk, timeout)
+            # The whole message, including the terminating ".\r\n", has now
+            # been handed to the transport. Delivery can no longer be ruled
+            # out, so any failure from here on has an unknown outcome.
+            self._data_committed = True
             response = await self._read_response_or_close(timeout=timeout)
             if response.code != SMTPStatus.completed:
                 raise SMTPDataError(response.code, response.message)
